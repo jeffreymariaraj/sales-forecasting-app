@@ -1,0 +1,11 @@
+# Ignore virtual environment
+venv/
+__pycache__/
+
+# Ignore cache files
+*.pyc
+*.pyo
+*.log
+
+# Ignore Streamlit-specific cache
+.streamlit/
