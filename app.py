@@ -1,4 +1,5 @@
 import streamlit as st
+from streamlit.components.v1 import html
 import pandas as pd
 import numpy as np
 from prophet import Prophet
@@ -8,6 +9,12 @@ import plotly.express as px
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 import warnings
+import xgboost as xgb
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
+from sklearn.preprocessing import MinMaxScaler
+import json
+from streamlit.components.v1 import declare_component
 warnings.filterwarnings('ignore')
 
 # Set page config
@@ -138,6 +145,156 @@ def prepare_data(df, target_column):
     except Exception as e:
         st.error(f"Error in data preparation: {str(e)}")
         return None
+def create_sequences(data, seq_length):
+    """Create sequences for LSTM model"""
+    sequences = []
+    targets = []
+    
+    for i in range(len(data) - seq_length):
+        seq = data[i:(i + seq_length)]
+        target = data[i + seq_length]
+        sequences.append(seq)
+        targets.append(target)
+    
+    return np.array(sequences), np.array(targets)
+
+def lstm_forecast(data, forecast_days, seq_length=30):
+    """Generate forecast using LSTM model"""
+    try:
+        # Scale the data
+        scaler = MinMaxScaler()
+        scaled_data = scaler.fit_transform(data[['Target']])
+        
+        # Create sequences for training
+        X, y = create_sequences(scaled_data, seq_length)
+        
+        # Build LSTM model
+        model = Sequential([
+            LSTM(50, activation='relu', input_shape=(seq_length, 1), return_sequences=True),
+            LSTM(50, activation='relu'),
+            Dense(1)
+        ])
+        
+        model.compile(optimizer='adam', loss='mse')
+        
+        # Reshape input for LSTM [samples, time steps, features]
+        X = X.reshape((X.shape[0], X.shape[1], 1))
+        
+        # Train model
+        model.fit(X, y, epochs=50, batch_size=32, verbose=0)
+        
+        # Generate forecast
+        forecast = []
+        current_sequence = scaled_data[-seq_length:]
+        
+        for _ in range(forecast_days):
+            # Reshape current sequence for prediction
+            current_sequence_reshaped = current_sequence.reshape((1, seq_length, 1))
+            
+            # Get prediction
+            next_pred = model.predict(current_sequence_reshaped, verbose=0)
+            
+            # Append prediction to forecast
+            forecast.append(next_pred[0, 0])
+            
+            # Update sequence
+            current_sequence = np.append(current_sequence[1:], next_pred)
+        
+        # Inverse transform predictions
+        forecast = scaler.inverse_transform(np.array(forecast).reshape(-1, 1))
+        
+        # Create forecast dates
+        last_date = data['DateKey'].iloc[-1]
+        forecast_dates = pd.date_range(start=last_date + timedelta(days=1), periods=forecast_days)
+        
+        # Create forecast DataFrame
+        forecast_df = pd.DataFrame({
+            'DateKey': forecast_dates,
+            'Forecast': forecast.flatten()
+        })
+        
+        return forecast_df
+        
+    except Exception as e:
+        st.error(f"Error in LSTM forecasting: {str(e)}")
+        return None
+
+def xgboost_forecast(data, forecast_days, seq_length=30):
+    """Generate forecast using XGBoost model"""
+    try:
+        # Create features for XGBoost
+        df = data.copy()
+        
+        # Add time-based features
+        df['Year'] = df['DateKey'].dt.year
+        df['Month'] = df['DateKey'].dt.month
+        df['DayOfWeek'] = df['DateKey'].dt.dayofweek
+        df['DayOfMonth'] = df['DateKey'].dt.day
+        
+        # Create lag features
+        for i in range(1, seq_length + 1):
+            df[f'lag_{i}'] = df['Target'].shift(i)
+        
+        # Drop rows with NaN values
+        df = df.dropna()
+        
+        # Prepare features and target
+        features = ['Year', 'Month', 'DayOfWeek', 'DayOfMonth'] + [f'lag_{i}' for i in range(1, seq_length + 1)]
+        X = df[features]
+        y = df['Target']
+        
+        # Train XGBoost model
+        model = xgb.XGBRegressor(
+            objective='reg:squarederror',
+            n_estimators=100,
+            learning_rate=0.1,
+            max_depth=6
+        )
+        
+        model.fit(X, y)
+        
+        # Generate forecast
+        forecast = []
+        current_data = df.iloc[-1:].copy()
+        
+        for _ in range(forecast_days):
+            # Update time features for next day
+            next_date = current_data['DateKey'].iloc[-1] + timedelta(days=1)
+            new_row = pd.DataFrame({
+                'DateKey': [next_date],
+                'Year': [next_date.year],
+                'Month': [next_date.month],
+                'DayOfWeek': [next_date.dayofweek],
+                'DayOfMonth': [next_date.day]
+            })
+            
+            # Update lag features
+            for i in range(1, seq_length + 1):
+                new_row[f'lag_{i}'] = current_data['Target'].iloc[-1] if i == 1 else current_data[f'lag_{i-1}'].iloc[-1]
+            
+            # Make prediction
+            pred = model.predict(new_row[features])
+            forecast.append(pred[0])
+            
+            # Update current data for next iteration
+            new_row['Target'] = pred[0]
+            current_data = pd.concat([current_data, new_row]).iloc[1:].copy()
+        
+        # Create forecast dates
+        last_date = data['DateKey'].iloc[-1]
+        forecast_dates = pd.date_range(start=last_date + timedelta(days=1), periods=forecast_days)
+        
+        # Create forecast DataFrame
+        forecast_df = pd.DataFrame({
+            'DateKey': forecast_dates,
+            'Forecast': forecast
+        })
+        
+        return forecast_df
+        
+    except Exception as e:
+        st.error(f"Error in XGBoost forecasting: {str(e)}")
+        return None
 
 def prophet_forecast(data, forecast_days):
     """Generate forecast using Prophet model"""
@@ -173,11 +330,13 @@ def sarima_forecast(data, forecast_days):
         st.error(f"Error in SARIMA forecasting: {str(e)}")
         return None
 
-def plot_forecasts(data, prophet_forecast, sarima_forecast, target_column):
+def plot_all_forecasts(data, prophet_forecast, sarima_forecast, lstm_forecast, xgb_forecast, target_column):
+    """Plot all forecasts in a 2x2 grid"""
     fig = make_subplots(
-        rows=2, cols=1,
-        subplot_titles=("Prophet Forecast", "SARIMA Forecast"),
-        vertical_spacing=0.15
+        rows=2, cols=2,
+        subplot_titles=("Prophet Forecast", "SARIMA Forecast", "LSTM Forecast", "XGBoost Forecast"),
+        vertical_spacing=0.15,
+        horizontal_spacing=0.1
     )
     
     # Prophet Plot
@@ -185,7 +344,6 @@ def plot_forecasts(data, prophet_forecast, sarima_forecast, target_column):
         go.Scatter(x=data['DateKey'], y=data['Target'], name="Historical Data", mode='lines'),
         row=1, col=1
     )
-    
     fig.add_trace(
         go.Scatter(
             x=prophet_forecast['ds'],
@@ -206,9 +364,8 @@ def plot_forecasts(data, prophet_forecast, sarima_forecast, target_column):
             mode='lines',
             showlegend=False
         ),
-        row=2, col=1
+        row=1, col=2
     )
-    
     fig.add_trace(
         go.Scatter(
             x=sarima_forecast.predicted_mean.index,
@@ -217,13 +374,59 @@ def plot_forecasts(data, prophet_forecast, sarima_forecast, target_column):
             mode='lines',
             line=dict(color='green')
         ),
+        row=1, col=2
+    )
+    
+    # LSTM Plot
+    fig.add_trace(
+        go.Scatter(
+            x=data['DateKey'],
+            y=data['Target'],
+            name="Historical Data",
+            mode='lines',
+            showlegend=False
+        ),
+        row=2, col=1
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=lstm_forecast['DateKey'],
+            y=lstm_forecast['Forecast'],
+            name="LSTM Forecast",
+            mode='lines',
+            line=dict(color='blue')
+        ),
         row=2, col=1
     )
     
-    fig.update_layout(
-        height=800,
-        title_text=f"{target_column} Forecast Comparison"
+    # XGBoost Plot
+    fig.add_trace(
+        go.Scatter(
+            x=data['DateKey'],
+            y=data['Target'],
+            name="Historical Data",
+            mode='lines',
+            showlegend=False
+        ),
+        row=2, col=2
     )
+    fig.add_trace(
+        go.Scatter(
+            x=xgb_forecast['DateKey'],
+            y=xgb_forecast['Forecast'],
+            name="XGBoost Forecast",
+            mode='lines',
+            line=dict(color='purple')
+        ),
+        row=2, col=2
+    )
+    
+    fig.update_layout(
+        height=1000,
+        title_text=f"{target_column} Forecast Comparison",
+        showlegend=True
+    )
+    
     return fig
 
 # File uploader
@@ -263,14 +466,18 @@ if uploaded_file is not None:
                 if query:
                     suggestions = get_query_suggestions(query, column_names)
                     if suggestions:
-                        selected_suggestion = st.selectbox(
-                            "Suggestions",
-                            options=suggestions,
-                            key="query_suggestions"
-                        )
-                        if selected_suggestion:
-                            if st.button("Insert Suggestion"):
-                                query += selected_suggestion
+                        st.markdown("### Suggestions")
+                        cols = st.columns(3)
+                        for idx, suggestion in enumerate(suggestions):
+                            with cols[idx % 3]:
+                                if st.button(f"Insert: {suggestion}", key=f"suggest_{idx}"):
+                                    # If suggestion is an operator, add spaces around it
+                                    if any(op.strip() == suggestion.strip() for op in [' > ', ' < ', ' >= ', ' <= ', ' == ', ' != ', ' and ', ' or ']):
+                                        new_query = query + f" {suggestion.strip()} "
+                                    else:
+                                        new_query = query + suggestion
+                                    st.session_state.current_query = new_query
+                                    st.rerun()
                 
                 # Add execute query button
                 if st.button("Execute Query"):
@@ -278,16 +485,103 @@ if uploaded_file is not None:
                         # Execute the query and show results
                         filtered_df = df.query(query)
                         st.write(f"Found {len(filtered_df)} matching rows")
-                        st.dataframe(filtered_df)
-                        
-                        # Add download button for filtered results
-                        csv = filtered_df.to_csv(index=False)
-                        st.download_button(
-                            label="Download Filtered Data",
-                            data=csv,
-                            file_name="filtered_data.csv",
-                            mime="text/csv"
-                        )
+                        st.dataframe(filtered_df.head(5))
+                        table_html = filtered_df.to_html(classes=[
+                                'table', 
+                                'table-striped', 
+                                'table-hover', 
+                                'table-bordered'
+                            ], escape=False)
+                        popup_content = f"""
+                            <div style="
+                                padding: 20px;
+                                background-color: white;
+                                border-radius: 8px;
+                                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                            ">
+                                <style>
+                                    .table {{
+                                        width: 100%;
+                                        border-collapse: collapse;
+                                        margin-bottom: 1rem;
+                                        background-color: white;
+                                    }}
+                                    .table th,
+                                    .table td {{
+                                        padding: 12px;
+                                        vertical-align: top;
+                                        border: 1px solid #dee2e6;
+                                    }}
+                                    .table thead th {{
+                                        vertical-align: bottom;
+                                        background-color: #f8f9fa;
+                                        border-bottom: 2px solid #dee2e6;
+                                    }}
+                                    .table-striped tbody tr:nth-of-type(odd) {{
+                                        background-color: rgba(0,0,0,.05);
+                                    }}
+                                    .table-hover tbody tr:hover {{
+                                        background-color: rgba(0,0,0,.075);
+                                    }}
+                                </style>
+                                {table_html}
+                            </div>
+                        """
+                            
+                            # Create JavaScript for popup
+                        js = f"""
+                            <script>
+                            function openPopup() {{
+                                var w = window.open('', 'Query Results', 'width=800,height=600,scrollbars=yes');
+                                w.document.write(`
+                                    <html>
+                                        <head>
+                                            <title>Query Results</title>
+                                            <style>
+                                                body {{ font-family: Arial, sans-serif; margin: 20px; }}
+                                                .table {{ border-collapse: collapse; width: 100%; }}
+                                                .table th, .table td {{ border: 1px solid #ddd; padding: 8px; }}
+                                                .table tr:nth-child(even) {{ background-color: #f2f2f2; }}
+                                                .table th {{ 
+                                                    padding-top: 12px;
+                                                    padding-bottom: 12px;
+                                                    text-align: left;
+                                                    background-color: #4CAF50;
+                                                    color: white;
+                                                }}
+                                            </style>
+                                        </head>
+                                        <body>
+                                            <h2>Query Results ({len(filtered_df)} rows)</h2>
+                                            {table_html}
+                                            <button onclick="window.print()">Print</button>
+                                            <button onclick="window.close()">Close</button>
+                                        </body>
+                                    </html>
+                                `);
+                                w.document.close();
+                            }}
+                            </script>
+                            <button 
+                                onclick="openPopup()" 
+                                style="
+                                    padding: 10px 20px;
+                                    background-color: #4CAF50;
+                                    color: white;
+                                    border: none;
+                                    border-radius: 4px;
+                                    cursor: pointer;
+                                    margin: 10px 0;
+                                "
+                            >
+                                Open Results in Popup
+                            </button>
+                        """
+                            
+                        # Display the button that triggers the popup
+                        st.components.v1.html(js, height=50)
+
+
                     except Exception as e:
                         st.error(f"Error executing query: {str(e)}")
                         st.info("Please check your query syntax and try again")
@@ -382,6 +676,9 @@ if uploaded_file is not None:
             
             # Forecasting Section
             with tabs[2]:
+                # Initialize session state for query text
+                if "forecast_query" not in st.session_state:
+                    st.session_state.forecast_query = ""
                 st.subheader("Forecasting Dashboard")
                 
                 # Create query input box for forecasting with suggestions
@@ -391,19 +688,22 @@ if uploaded_file is not None:
                     key="forecast_query",
                     help="Enter your query to filter data before forecasting. Example: 'column_name > 100'"
                 )
-                
+
                 # Show suggestions for forecasting query
-                if forecast_query:
-                    suggestions = get_query_suggestions(forecast_query, column_names)
+                query_text = st.session_state.forecast_query
+                if query_text:
+                    suggestions = get_query_suggestions(query_text, column_names)
                     if suggestions:
                         selected_suggestion = st.selectbox(
                             "Suggestions",
-                            options=suggestions,
+                            options=[""] + suggestions,  # Add an empty option as default
                             key="forecast_suggestions"
-                        )
+                            )
                         if selected_suggestion:
-                            if st.button("Insert Suggestion", key="forecast_suggest_button"):
-                                forecast_query += selected_suggestion
+                            if st.button("Insert Suggestion", key="forecast_suggestions"):
+                # Append the selected suggestion to the query
+                                st.session_state.forecast_query += selected_suggestion
+                                st.experimental_rerun()
                 
                 # Add filter button
                 if st.button("Apply Filters"):
@@ -439,42 +739,73 @@ if uploaded_file is not None:
                 daily_data = prepare_data(st.session_state.filtered_df, target_column)
                 
                 if daily_data is not None:
+                    
                     if st.sidebar.button("Generate Forecast"):
                         with st.spinner("Generating forecasts..."):
                             try:
-                                # Generate forecasts using filtered data
+                # Generate forecasts using filtered data
                                 prophet_results = prophet_forecast(daily_data, forecast_days)
                                 sarima_results = sarima_forecast(daily_data, forecast_days)
-                                
-                                # Plot results
-                                fig = plot_forecasts(daily_data, prophet_results, sarima_results, target_column)
+                                lstm_results = lstm_forecast(daily_data, forecast_days)
+                                xgb_results = xgboost_forecast(daily_data, forecast_days)
+                
+                # Plot results
+                                fig = plot_all_forecasts(
+                                    daily_data,
+                                    prophet_results,
+                                    sarima_results,
+                                    lstm_results,
+                                    xgb_results,
+                                    target_column
+                                )
                                 st.plotly_chart(fig, use_container_width=True)
-                                
-                                # Download section
+                
+                # Download section
                                 st.subheader("Download Forecasts")
-                                col1, col2 = st.columns(2)
-                                
+                                col1, col2, col3, col4 = st.columns(4)
+                
                                 with col1:
+                                    prophet_csv = prophet_results[['ds', 'yhat']].to_csv(index=False)
                                     st.download_button(
-                                        label="Download Prophet Forecast",
-                                        data=prophet_forecast_df.to_csv(index=False),
-                                        file_name=f"prophet_forecast_{target_column}.csv",
-                                        mime="text/csv"
+                        label="Download Prophet Forecast",
+                        data=prophet_csv,
+                        file_name=f"prophet_forecast_{target_column}.csv",
+                        mime="text/csv"
                                     )
-                                
+                
                                 with col2:
+                                    sarima_csv = pd.DataFrame({
+                                        'date': sarima_results.predicted_mean.index,
+                                        'forecast': sarima_results.predicted_mean
+                                    }).to_csv(index=False)
                                     st.download_button(
                                         label="Download SARIMA Forecast",
-                                        data=sarima_forecast_df.to_csv(index=False),
+                                        data=sarima_csv,
                                         file_name=f"sarima_forecast_{target_column}.csv",
                                         mime="text/csv"
                                     )
-                            
+                
+                                with col3:
+                                    lstm_csv = lstm_results.to_csv(index=False)
+                                    st.download_button(
+                                        label="Download LSTM Forecast",
+                                        data=lstm_csv,
+                                        file_name=f"lstm_forecast_{target_column}.csv",
+                                        mime="text/csv"
+                                    )
+                
+                                with col4:
+                                    xgb_csv = xgb_results.to_csv(index=False)
+                                    st.download_button(
+                                        label="Download XGBoost Forecast",
+                                        data=xgb_csv,
+                                        file_name=f"xgb_forecast_{target_column}.csv",
+                                        mime="text/csv"
+                                    )
+                
                             except Exception as e:
                                 st.error(f"Error in forecasting: {str(e)}")
                                 st.info("Try adjusting your parameters or check your data format")
-                else:
-                    st.error("Error in data preparation. Please check your data format.")
         
         except Exception as e:
             st.error(f"Error: {str(e)}")
