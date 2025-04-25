@@ -1,0 +1,58 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Environment variables and secrets
+.env
+.env.*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# VS Code settings
+.vscode/
+
+# Python virtual environment
+venv/
+ENV/
+env/
+
+# Compiled C extensions
+*.so
+
+# Log files
+*.log
+
+# Encryption keys
+*.key
+
+# MySQL dumps
+*.sql
+
+# Ignore model artifacts
+*.h5
+*.pkl
+*.joblib
+
+# Ignore test and temp files
+*.tmp
+*.bak
+
+# Ignore coverage reports
+htmlcov/
+.coverage
+.coverage.*
+.cache
+
+# Ignore build artifacts
+dist/
+build/
+*.egg-info/
+
+# Ignore node_modules (if using JS tools)
+node_modules/
